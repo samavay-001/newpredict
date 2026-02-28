@@ -1,0 +1,31 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# venv
+venv/
+.venv/
+
+# PyCharm
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / local configs (按需改名)
+.env
+*.key
+*.pem
+secrets*.json
+config*.json
+
+# Data / cache (如果你有大数据目录可加)
+data/
+cache/
