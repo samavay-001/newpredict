@@ -2,6 +2,7 @@ import sys
 import os
 import argparse
 import time
+from apredict.io.stock_meta import load_stock_meta, attach_stock_meta
 
 # 让 Python 能找到 src/apredict（src-layout）
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
@@ -49,11 +50,14 @@ def to_chinese_columns_with_stars(df):
     """
     mapping = {
         "trade_date": "交易日期",
+        "ml_prob": "AI预测概率",
         "rank": "排名",
         "code": "股票代码",
         "rank_score": "综合评分",
         "prob_calibrated": "预测概率",
         "prob_raw": "原始概率",
+        "ts_code": "TS代码",
+        "name": "股票名称",
 
         "open": "开盘价",
         "close": "收盘价",
@@ -91,9 +95,11 @@ def to_chinese_columns_with_stars(df):
     order = [
         "排名",
         "股票代码",
+        "股票名称",
         "推荐星级",
         "综合评分",
         "预测概率",
+        "AI预测概率",
 
         "收盘价",
         "涨跌幅%",
@@ -124,6 +130,10 @@ def main(daily_path: str, topk: int):
     # 1) 读取当日快照
     snapshot = load_daily_snapshot(daily_path)
     trade_date = str(snapshot["trade_date"].iloc[0])
+
+    # ✅ 加载股票列表并补齐名称
+    meta = load_stock_meta("data/meta/stock_basic.csv")
+    snapshot = attach_stock_meta(snapshot, meta)
 
     # 2) Phase A：过滤候选池
     universe = phase_a_filter(snapshot)
