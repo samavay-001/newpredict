@@ -1,13 +1,21 @@
 # scripts/run_daily.py
-import sys
+from __future__ import annotations
+
 import os
+import sys
 import argparse
-import time
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 
 # 让 Python 能找到 src/apredict（src-layout）
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.append(str(SRC))
 
 from apredict.io.loader import load_daily_snapshot, load_history_for_code
 from apredict.io.stock_meta import load_stock_meta, attach_stock_meta
@@ -15,358 +23,300 @@ from apredict.phase_a.filter import phase_a_firstboard_snapshot
 from apredict.phase_b.rank import rank_candidates
 from apredict.tracking.tracker import append_tracking
 
-
-# =========================
-# utils
-# =========================
-def safe_to_csv(df: pd.DataFrame, path: str, **kwargs) -> str:
-    """
-    Windows 上 Excel/WPS 占用文件时，自动重试 & 自动加 _1/_2...
-    """
-    base, ext = os.path.splitext(path)
-    for i in range(0, 30):
-        p = path if i == 0 else f"{base}_{i}{ext}"
-        try:
-            df.to_csv(p, **kwargs)
-            return p
-        except PermissionError:
-            time.sleep(0.2)
-    raise PermissionError(f"文件被占用且多次重试失败：{path}（请关闭Excel/WPS/预览窗格）")
+# ✅ live_tracking.xlsx 自动回填 + 追加
+from apredict.tracking.live_tracker import (
+    LiveTrackingConfig,
+    update_realized_for_target_date,
+    append_predictions,
+)
 
 
-def pick_sort_col(df: pd.DataFrame) -> str | None:
-    """
-    选择用于“展示概率校准”的排序字段（不改变你交易排序逻辑，只用于映射）
-    """
-    for c in ["ml_prob", "rank_score", "prob_raw"]:
-        if c in df.columns:
-            return c
-    return None
+# -----------------------------
+# 交易日处理：严格下一个交易日（优先从 parquet 日历），失败则自然日+1跳周末
+# -----------------------------
+def _try_next_trade_date_from_parquet(trade_date: str, parquet_path: Path) -> Optional[str]:
+    if not parquet_path.exists():
+        return None
+    try:
+        import pyarrow.dataset as ds
+    except Exception:
+        return None
+
+    try:
+        dataset = ds.dataset(str(parquet_path), format="parquet")
+        table = dataset.to_table(columns=["trade_date"])
+        s = table.column("trade_date").to_pandas()
+        cal = pd.Series(s).dropna().astype(int).drop_duplicates().sort_values().tolist()
+        td = int(trade_date)
+        for d in cal:
+            if d > td:
+                return f"{d:08d}"
+        return None
+    except Exception:
+        return None
 
 
-def calibrate_prob_by_rank(df: pd.DataFrame, score_col: str, top_anchors=None) -> pd.DataFrame:
-    """
-    截面校准：不改变排序，只把“分数/概率”映射成更像真实概率的数值，便于展示/沟通。
-    - 输入 df：至少有 score_col
-    - 输出 df：新增 prob_calibrated（0~1）
-    """
-    if top_anchors is None:
-        top_anchors = [
-            (1, 0.30),
-            (5, 0.18),
-            (10, 0.12),
-            (20, 0.08),
-            (50, 0.04),
-        ]
+def get_next_trade_date(trade_date: str) -> str:
+    parquet_path = ROOT / "data" / "cache_history" / "market_daily.parquet"
+    nxt = _try_next_trade_date_from_parquet(trade_date, parquet_path)
+    if nxt:
+        return nxt
 
+    dt = datetime.strptime(trade_date, "%Y%m%d") + timedelta(days=1)
+    while dt.weekday() >= 5:
+        dt += timedelta(days=1)
+    return dt.strftime("%Y%m%d")
+
+
+# -----------------------------
+# 展示增强：概率校准 + 星级
+# -----------------------------
+def calibrate_prob_by_rank(df: pd.DataFrame, score_col: str) -> pd.DataFrame:
     out = df.copy()
     if out.empty or score_col not in out.columns:
         out["prob_calibrated"] = np.nan
         return out
 
     out = out.sort_values(score_col, ascending=False).reset_index(drop=True)
-    n = len(out)
-    ranks = np.arange(1, n + 1)
+    out["rank"] = np.arange(1, len(out) + 1)
 
-    ks = np.array([k for k, _ in top_anchors], dtype=float)
-    ps = np.array([p for _, p in top_anchors], dtype=float)
+    anchors = [
+        (1, 0.30),
+        (5, 0.18),
+        (10, 0.12),
+        (20, 0.08),
+        (50, 0.04),
+        (100, 0.025),
+        (200, 0.015),
+        (500, 0.010),
+    ]
 
-    floor = 0.01
-    prob = np.empty(n, dtype=float)
+    ranks = out["rank"].to_numpy(dtype=float)
+    anchor_r = np.array([a[0] for a in anchors], dtype=float)
+    anchor_p = np.array([a[1] for a in anchors], dtype=float)
 
-    for i, r0 in enumerate(ranks):
-        r = int(r0)
+    p = np.interp(np.minimum(ranks, anchor_r[-1]), anchor_r, anchor_p)
+    tail = ranks > anchor_r[-1]
+    if np.any(tail):
+        r0, p0 = anchor_r[-1], anchor_p[-1]
+        r1 = max(r0 + 1, float(len(out)))
+        p1 = 0.005
+        p[tail] = p0 + (p1 - p0) * ((ranks[tail] - r0) / (r1 - r0))
 
-        if r <= int(ks[0]):
-            prob[i] = float(ps[0])
-
-        elif r >= int(ks[-1]):
-            denom = max(int(n) - int(ks[-1]), 1)
-            t = (r - int(ks[-1])) / denom
-            prob[i] = float(ps[-1]) * (1 - t) + float(floor) * t
-
-        else:
-            j = int(np.searchsorted(ks, r) - 1)
-            k1, p1 = float(ks[j]), float(ps[j])
-            k2, p2 = float(ks[j + 1]), float(ps[j + 1])
-
-            denom = max(k2 - k1, 1.0)
-            t = (r - k1) / denom
-            prob[i] = p1 * (1 - t) + p2 * t
-
-    out["prob_calibrated"] = np.clip(prob, 0.0, 1.0)
+    out["prob_calibrated"] = np.clip(p, 0.0, 1.0)
     return out
 
 
-# =========================
-# stars (稳定版)
-# =========================
-def stars_topk_fixed(rank: int) -> str:
-    """
-    ✅ 最稳：TopK 展示固定映射
-    Top1: ★★★★★
-    Top2: ★★★★☆
-    Top3: ★★★☆☆
-    Top4: ★★☆☆☆
-    Top5+: ★☆☆☆☆
-    """
-    rank = int(rank)
-    if rank <= 1:
-        return "★★★★★"
-    if rank == 2:
-        return "★★★★☆"
-    if rank == 3:
-        return "★★★☆☆"
-    if rank == 4:
-        return "★★☆☆☆"
-    return "★☆☆☆☆"
+def add_star_rating(df: pd.DataFrame, key_col: str) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        out["star"] = ""
+        return out
+
+    if "rank" not in out.columns:
+        if key_col in out.columns:
+            out = out.sort_values(key_col, ascending=False).reset_index(drop=True)
+        out["rank"] = np.arange(1, len(out) + 1)
+
+    def stars(r: int) -> str:
+        if r <= 5:
+            return "★★★★★"
+        if r <= 10:
+            return "★★★★☆"
+        if r <= 20:
+            return "★★★☆☆"
+        if r <= 50:
+            return "★★☆☆☆"
+        return "★☆☆☆☆"
+
+    out["star"] = out["rank"].astype(int).apply(stars)
+    return out
 
 
-def stars_by_rank(rank: int, k: int) -> str:
-    """
-    你原来的“分位星级”（保留），但注意：Top5 时它与 fixed 是一致的；
-    若你后面 topk>5，分位更有意义。
-    """
-    if k <= 1:
-        return "★★★★★"
-    rank = int(rank)
-    k = int(k)
-    q = rank / k  # 1/k ~ 1
-
-    if q <= 0.20:
-        return "★★★★★"
-    if q <= 0.40:
-        return "★★★★☆"
-    if q <= 0.60:
-        return "★★★☆☆"
-    if q <= 0.80:
-        return "★★☆☆☆"
-    return "★☆☆☆☆"
+def _pick_sort_key(df: pd.DataFrame) -> str:
+    for c in ["ml_prob", "rank_score", "prob_calibrated", "prob_raw"]:
+        if c in df.columns:
+            return c
+    return "rank"
 
 
-# =========================
-# output (CN)
-# =========================
-def to_chinese_columns_with_stars(df: pd.DataFrame, use_fixed_topk: bool = True) -> pd.DataFrame:
+# -----------------------------
+# FirstBoard-Strict（二段严格池）
+# -----------------------------
+def firstboard_strict_filter(features: pd.DataFrame) -> pd.DataFrame:
+    df = features.copy()
+    if df.empty:
+        return df
+
+    mask = pd.Series(True, index=df.index)
+
+    if "atr_pct" in df.columns:
+        mask &= df["atr_pct"].fillna(1.0) <= 0.08
+    if "dist_to_hh20" in df.columns:
+        mask &= df["dist_to_hh20"].fillna(0.0) >= 0.01
+    if "amount_ratio" in df.columns:
+        mask &= df["amount_ratio"].fillna(0.0) >= 1.10
+
+    if "upper_shadow_ratio" in df.columns:
+        mask &= df["upper_shadow_ratio"].fillna(1.0) <= 0.45
+    if "close_strength" in df.columns:
+        mask &= df["close_strength"].fillna(0.0) >= 0.45
+
+    if "vol_ratio_10" in df.columns:
+        mask &= df["vol_ratio_10"].fillna(0.0) >= 1.05
+    if "pos_20" in df.columns:
+        mask &= df["pos_20"].fillna(0.0).between(0.15, 0.95)
+
+    if "is_limit_up_today" in df.columns:
+        mask &= df["is_limit_up_today"].fillna(0).astype(int) == 0
+
+    return df[mask].copy()
+
+
+# -----------------------------
+# 输出列映射（简版）
+# -----------------------------
+def to_chinese_columns(df: pd.DataFrame) -> pd.DataFrame:
     mapping = {
-        "trade_date": "交易日期",
-        "ml_prob": "AI预测概率",
         "rank": "排名",
         "code": "股票代码",
-        "rank_score": "综合评分",
-        "prob_calibrated": "预测概率",
-        "prob_raw": "原始概率",
-        "ts_code": "TS代码",
         "name": "股票名称",
-
-        "open": "开盘价",
+        "star": "推荐星级",
+        "rank_score": "综合评分",
+        "ml_prob": "AI预测概率",
+        "prob_calibrated": "预测概率",
         "close": "收盘价",
-        "high": "最高价",
-        "low": "最低价",
         "pct_chg": "涨跌幅%",
-        "amount": "成交额",
-
         "amount_ratio": "放量倍数",
         "breakout_20": "突破20日新高",
-
         "ret_5": "5日涨幅%",
         "ret_10": "10日涨幅%",
         "ret20": "20日涨幅%",
-
         "atr_pct": "ATR波动率%",
-
         "limit_ups_20": "20日涨停次数",
         "upper_shadow_ratio": "上影线比例",
         "close_strength": "收盘强度",
-
-        "hh20": "20日最高价",
-        "ma20": "20日均线",
+        "trade_date": "交易日期",
+        "ts_code": "TS代码",
     }
+    out = df.copy()
+    cols = [c for c in out.columns if c in mapping]
+    return out[cols].rename(columns={c: mapping[c] for c in cols})
 
-    df_cn = df.rename(columns=mapping).copy()
 
-    # 确保“排名”存在：没有就按 AI预测概率/综合评分生成
-    if "排名" not in df_cn.columns:
-        if "AI预测概率" in df_cn.columns:
-            df_cn["排名"] = df_cn["AI预测概率"].rank(ascending=False, method="first").astype(int)
-        elif "综合评分" in df_cn.columns:
-            df_cn["排名"] = df_cn["综合评分"].rank(ascending=False, method="first").astype(int)
-        elif "预测概率" in df_cn.columns:
-            df_cn["排名"] = df_cn["预测概率"].rank(ascending=False, method="first").astype(int)
+# -----------------------------
+# 主流程
+# -----------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--daily-path", required=True, help="data/raw/daily_YYYY-MM-DD.csv 或 data/raw/daily_YYYYMMDD.csv")
+    parser.add_argument("--topk", type=int, default=5)
+    args = parser.parse_args()
+
+    daily_path = Path(args.daily_path)
+    if not daily_path.exists():
+        raise FileNotFoundError(f"daily_path not found: {daily_path}")
+
+    # 从文件名解析 trade_date（优先）
+    stem = daily_path.stem
+    trade_date = None
+    if "daily_" in stem:
+        s = stem.split("daily_", 1)[1].replace("-", "")
+        if len(s) == 8 and s.isdigit():
+            trade_date = s
+    if trade_date is None:
+        tmp = pd.read_csv(daily_path, nrows=1)
+        if "trade_date" in tmp.columns:
+            trade_date = str(int(tmp.loc[0, "trade_date"])).zfill(8)
         else:
-            df_cn["排名"] = list(range(1, len(df_cn) + 1))
+            raise ValueError("无法解析 trade_date：文件名和内容都不包含 trade_date")
 
-    # ✅ k 用 len(df_cn) 才绝对正确（不要用 max(排名)，避免缺号/重复号导致错星）
-    k = len(df_cn)
-
-    if use_fixed_topk:
-        df_cn["推荐星级"] = df_cn["排名"].astype(int).apply(stars_topk_fixed)
-    else:
-        df_cn["推荐星级"] = df_cn["排名"].astype(int).apply(lambda r: stars_by_rank(int(r), k))
-
-    order = [
-        "排名", "股票代码", "股票名称", "推荐星级",
-        "综合评分", "预测概率", "AI预测概率",
-        "收盘价", "涨跌幅%", "成交额",
-        "放量倍数", "突破20日新高",
-        "5日涨幅%", "10日涨幅%", "20日涨幅%",
-        "ATR波动率%", "20日涨停次数",
-        "上影线比例", "收盘强度",
-        "交易日期", "TS代码",
-    ]
-    order = [c for c in order if c in df_cn.columns]
-    rest = [c for c in df_cn.columns if c not in order]
-    return df_cn[order + rest]
-
-
-# =========================
-# strict first-board filter (after features)
-# =========================
-def strict_firstboard_filter_after_features(
-    features_df: pd.DataFrame,
-    vol_ratio_min: float = 1.3,
-    pos20_max: float = 0.80,
-    shadow_max: float = 0.06,
-) -> pd.DataFrame:
-    """
-    PhaseB 已算出滚动特征后，再做严格首板过滤。
-    只在列存在时生效，保证兼容不同版本 features。
-    """
-    fb = features_df.copy()
-
-    if "limit_ups_20" in fb.columns:
-        fb = fb[fb["limit_ups_20"] == 0]
-    if "is_limit_up_today" in fb.columns:
-        fb = fb[fb["is_limit_up_today"] == 0]
-    if "is_limit_up_yday" in fb.columns:
-        fb = fb[fb["is_limit_up_yday"] == 0]
-
-    if "vol_ratio_10" in fb.columns:
-        fb = fb[fb["vol_ratio_10"] >= vol_ratio_min]
-
-    if "pos_20" in fb.columns:
-        fb = fb[fb["pos_20"] <= pos20_max]
-
-    if "upper_shadow_ratio" in fb.columns:
-        fb = fb[fb["upper_shadow_ratio"] <= shadow_max]
-
-    return fb
-
-
-# =========================
-# main
-# =========================
-def main(daily_path: str, topk: int):
     # 1) 当日快照
-    snapshot = load_daily_snapshot(daily_path)
-    trade_date = str(snapshot["trade_date"].iloc[0])
+    snapshot = load_daily_snapshot(str(daily_path))
 
-    # 2) 股票meta（补名称）
-    meta = load_stock_meta("data/meta/stock_basic.csv")
+    # 2) 股票 meta（补 name/ts_code 等）
+    meta = load_stock_meta(str(ROOT / "data" / "meta" / "stock_basic.csv"))
     snapshot = attach_stock_meta(snapshot, meta)
 
-    # 3) Phase A：快照首板过滤
+    # ✅ LiveTracking：先回填 target_date==today
+    live_cfg = LiveTrackingConfig(xlsx_path=Path("data/output/live_tracking.xlsx"))
+    try:
+        update_realized_for_target_date(snapshot_today=snapshot, today_trade_date=trade_date, cfg=live_cfg, verbose=True)
+    except Exception as e:
+        print(f"[LiveTracking] 回填异常（不中断主流程）：{type(e).__name__}: {e}")
+
+    # 3) Phase A：首板快照过滤
     universe = phase_a_firstboard_snapshot(snapshot, min_amount=1e8, verbose=True)
 
-    # 4) Phase B：计算特征 + 排序
-    history_dir = "data/history"
+    # 4) Phase B/C：特征+排序（注意：你的本地 rank_candidates 返回顺序是 features, pred）
+    history_dir = str(ROOT / "data" / "history")
     features, pred = rank_candidates(
         universe,
         lambda code: load_history_for_code(history_dir, code),
         trade_date,
-        topk,
+        args.topk,
     )
 
-    # 4.5) 严格首板过滤（二次缩池）再 TopK 覆盖 pred
+    # 5) FirstBoard-Strict（二段严格池）
     if features is not None and not features.empty:
-        fb = strict_firstboard_filter_after_features(
-            features,
-            vol_ratio_min=1.3,
-            pos20_max=0.80,
-            shadow_max=0.06,
-        )
-
-        sort_col = None
-        for c in ["ml_prob", "rank_score", "prob_calibrated", "prob_raw"]:
-            if c in fb.columns:
-                sort_col = c
-                break
-
-        if sort_col is not None and not fb.empty:
-            pred = fb.sort_values(sort_col, ascending=False).head(topk).copy()
-            print(f"[FirstBoard-Strict] pool_after_features={len(fb):,}  top{topk} by {sort_col}")
+        strict_pool = firstboard_strict_filter(features)
+        if not strict_pool.empty:
+            sort_key = _pick_sort_key(strict_pool)
+            pred = strict_pool.sort_values(sort_key, ascending=False).head(args.topk).copy()
+            pred["rank"] = np.arange(1, len(pred) + 1)
+            print(f"[FirstBoard-Strict] pool_after_features={len(strict_pool)}  top{args.topk} by {sort_key}")
         else:
-            print("[FirstBoard-Strict] skip (no sort_col or empty pool)")
-
-    # 5) 输出目录
-    out_dir = os.path.join("data", "processed", trade_date)
-    os.makedirs(out_dir, exist_ok=True)
-
-    # 6) 输出 universe/features/predictions
-    universe_path = safe_to_csv(
-        universe,
-        os.path.join(out_dir, "universe.csv"),
-        index=False,
-        encoding="utf-8-sig",
-    )
-
-    if features is None or features.empty:
-        print("没有生成 features（请检查历史数据是否缺失/字段是否异常）")
-        print(f"已输出 universe：{universe_path}")
-        return
-
-    features_path = safe_to_csv(
-        features,
-        os.path.join(out_dir, "features.csv"),
-        index=False,
-        encoding="utf-8-sig",
-    )
+            print("[FirstBoard-Strict] pool_after_features=0  skip")
 
     if pred is None or pred.empty:
-        print("没有生成预测结果 pred（请检查 PhaseB 排序逻辑/TopK 设置）")
-        print(f"已输出 features：{features_path}")
+        print("没有生成预测结果 pred（请检查 PhaseB/PhaseC）")
         return
 
-    # 7) 截面校准（展示用）
-    sort_col_for_cal = pick_sort_col(pred)
-    if sort_col_for_cal:
-        pred = calibrate_prob_by_rank(pred, score_col=sort_col_for_cal)
-        print(f"[Calibrate] prob_calibrated by {sort_col_for_cal}")
-    else:
-        pred["prob_calibrated"] = None
-        print("[Calibrate] skip (no rank_score/ml_prob/prob_raw)")
+    # 6) prob_calibrated（按排序键校准）
+    sort_key = _pick_sort_key(pred)
+    pred = calibrate_prob_by_rank(pred, score_col=sort_key)
+    print(f"[Calibrate] prob_calibrated by {sort_key}")
 
-    pred_path = safe_to_csv(
-        pred,
-        os.path.join(out_dir, "predictions.csv"),
-        index=False,
-        encoding="utf-8-sig",
-    )
+    # 7) 星级
+    pred = add_star_rating(pred, key_col=sort_key)
 
-    # 8) 中文版（含推荐星级）
-    pred_cn = to_chinese_columns_with_stars(pred, use_fixed_topk=True)  # ✅ 强烈推荐 True
-    pred_cn_path = safe_to_csv(
-        pred_cn,
-        os.path.join(out_dir, "predictions_中文.csv"),
-        index=False,
-        encoding="utf-8-sig",
-    )
+    # 8) 输出目录
+    out_dir = ROOT / "data" / "processed" / trade_date
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 9) tracking
+    universe_path = out_dir / "universe.csv"
+    features_path = out_dir / "features.csv"
+    pred_path = out_dir / "predictions.csv"
+    pred_cn_path = out_dir / "predictions_中文.csv"
+
+    universe.to_csv(universe_path, index=False, encoding="utf-8-sig")
+    if features is not None and not features.empty:
+        features.to_csv(features_path, index=False, encoding="utf-8-sig")
+    pred.to_csv(pred_path, index=False, encoding="utf-8-sig")
+
+    pred_cn = to_chinese_columns(pred)
+    pred_cn.to_csv(pred_cn_path, index=False, encoding="utf-8-sig")
+
+    # 9) tracking.csv（你现有逻辑）
     append_tracking(pred, "output/tracking.csv")
 
-    # 10) 摘要
+    # ✅ LiveTracking：追加今天预测（目标日 = 下一个交易日）
+    target_date = get_next_trade_date(trade_date)
+    try:
+        append_predictions(preds_topk=pred, predict_date=trade_date, target_date=target_date, cfg=live_cfg, verbose=True)
+    except Exception as e:
+        print(f"[LiveTracking] 追加异常（不中断主流程）：{type(e).__name__}: {e}")
+
+    # 10) 总结
     print(f"完成：{trade_date}")
     print(f"universe: {len(universe)} -> {universe_path}")
-    print(f"features: {len(features)} -> {features_path}")
-    print(f"predictions(top{topk}): {len(pred)} -> {pred_path}")
-    print(f"predictions_中文(top{topk}): {pred_cn_path}")
+    if features is not None and not features.empty:
+        print(f"features: {len(features)} -> {features_path}")
+    print(f"predictions(top{args.topk}): {len(pred)} -> {pred_path}")
+    print(f"predictions_中文(top{args.topk}): {pred_cn_path}")
     print("tracking: output/tracking.csv")
+    print(f"live_tracking: {live_cfg.xlsx_path} (sheet={live_cfg.sheet_name})")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--daily-path", required=True, help=r"data/raw/daily_2026-02-27.csv")
-    parser.add_argument("--topk", type=int, default=5)
-    args = parser.parse_args()
-    main(args.daily_path, args.topk)
+    main()
