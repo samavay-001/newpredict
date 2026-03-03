@@ -1,9 +1,13 @@
 import json
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
 from sklearn.metrics import average_precision_score, roc_auc_score
+
+# ✅ 统一特征入口（训练=线上）
+from apredict.features.feature_set import add_features_panel, FEATURE_COLS_DEFAULT
 
 DATA_PATH = Path("data/training/training.parquet")
 META_PATH = Path("data/meta/stock_basic.csv")
@@ -17,7 +21,6 @@ MODEL_META_PATH = MODEL_DIR / "lgb_first_limitup_meta.json"
 DATE_COL = "trade_date"
 CODE_COL = "code"
 
-# 近似涨停阈值
 LIMIT10 = 9.8
 LIMIT20 = 19.8
 
@@ -38,17 +41,10 @@ def _as_str_date(x: pd.Series) -> pd.Series:
     return out.astype(str)
 
 
-def _safe_div(a, b):
-    b = np.where(b == 0, np.nan, b)
-    return a / b
-
-
 def load_stock_basic() -> pd.DataFrame:
     """
-    读取 data/meta/stock_basic.csv
-    你给的示例看起来是“制表符分隔”，这里做了兼容：
-    - 自动尝试 sep='\t' 或 ','
-    - 自动尝试 utf-8-sig / gbk
+    从 data/meta/stock_basic.csv 读取股票元信息
+    需要中文列名：TS代码/股票代码/股票名称/市场类型/交易所代码/上市日期
     """
     encodings = ["utf-8-sig", "utf-8", "gbk"]
     seps = ["\t", ","]
@@ -58,21 +54,23 @@ def load_stock_basic() -> pd.DataFrame:
         for sep in seps:
             try:
                 df = pd.read_csv(META_PATH, encoding=enc, sep=sep)
-                # 必须包含这几列
                 need = ["TS代码", "股票代码", "股票名称", "市场类型", "交易所代码", "上市日期"]
                 if all(c in df.columns for c in need):
-                    # 规范字段
                     out = df[need].copy()
-                    out.rename(columns={
-                        "TS代码": "ts_code",
-                        "股票代码": "code",
-                        "股票名称": "name",
-                        "市场类型": "market_type",
-                        "交易所代码": "exchange",
-                        "上市日期": "list_date",
-                    }, inplace=True)
+                    out.rename(
+                        columns={
+                            "TS代码": "ts_code",
+                            "股票代码": "code",
+                            "股票名称": "name",
+                            "市场类型": "market_type",
+                            "交易所代码": "exchange",
+                            "上市日期": "list_date",
+                        },
+                        inplace=True,
+                    )
                     out["code"] = out["code"].astype(str).str.zfill(6)
                     out["list_date"] = _as_str_date(out["list_date"])
+                    # ✅ 用 meta 判定 ST（训练标签用这个最稳）
                     out["is_st_name"] = out["name"].astype(str).str.contains("ST", regex=False).astype(int)
                     return out
             except Exception as e:
@@ -96,15 +94,16 @@ def clean_and_validate(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def merge_meta(df: pd.DataFrame, basic: pd.DataFrame) -> pd.DataFrame:
+    """
+    合并 meta，并生成 days_listed（标签和阈值都要用）
+    """
     out = df.merge(basic, on="code", how="left")
 
-    # 缺失元信息的票（理论上很少），先标记为 unknown
     out["market_type"] = out["market_type"].fillna("未知")
     out["exchange"] = out["exchange"].fillna("UNK")
     out["list_date"] = out["list_date"].fillna("00000000")
     out["is_st_name"] = out["is_st_name"].fillna(0).astype(int)
 
-    # 上市天数特征（对剔除新股/次新很有用）
     td = pd.to_datetime(out[DATE_COL], format="%Y%m%d", errors="coerce")
     ld = pd.to_datetime(out["list_date"], format="%Y%m%d", errors="coerce")
     out["days_listed"] = (td - ld).dt.days
@@ -113,96 +112,19 @@ def merge_meta(df: pd.DataFrame, basic: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def limit_threshold_by_market(df: pd.DataFrame) -> np.ndarray:
-    """
-    根据 market_type 自动区分 10% / 20%
-    你这个 stock_basic.csv 的“市场类型”可能是：主板 / 创业板 / 科创板 等
-    """
-    mt = df["market_type"].astype(str)
-    is_20 = mt.str.contains("创业板") | mt.str.contains("科创板")
-    thr = np.where(is_20, LIMIT20, LIMIT10)
-    return thr.astype(float)
-
-
-def add_rolling_ratios(df: pd.DataFrame, windows=(5, 10, 20)) -> pd.DataFrame:
-    out = df.sort_values([CODE_COL, DATE_COL]).copy()
-    g = out.groupby(CODE_COL, group_keys=False)
-
-    for w in windows:
-        vma = g["vol"].rolling(w).mean().reset_index(level=0, drop=True)
-        ama = g["amount"].rolling(w).mean().reset_index(level=0, drop=True)
-        out[f"vol_ratio_{w}"] = (out["vol"] / vma.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        out[f"amount_ratio_{w}"] = (out["amount"] / ama.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    return out
-
-
-def add_price_position(df: pd.DataFrame, window=20) -> pd.DataFrame:
-    out = df.sort_values([CODE_COL, DATE_COL]).copy()
-    g = out.groupby(CODE_COL, group_keys=False)
-
-    hh = g["high"].rolling(window).max().reset_index(level=0, drop=True)
-    ll = g["low"].rolling(window).min().reset_index(level=0, drop=True)
-
-    denom = (hh - ll).replace(0, np.nan)
-    out[f"pos_{window}"] = ((out["close"] - ll) / denom).fillna(0.5).clip(0, 1)
-    out[f"dist_to_ll{window}"] = ((out["close"] - ll) / out["close"].replace(0, np.nan)).fillna(0.0).clip(0, 10)
-    # 你已有 dist_to_hh20，保留即可
-    return out
-
-
-def add_candle_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["range_pct"] = _safe_div(out["high"] - out["low"], out["close"]).fillna(0.0)
-    denom = (out["high"] - out["low"]).replace(0, np.nan)
-    out["close_strength2"] = ((out["close"] - out["low"]) / denom).fillna(0.0).clip(0, 1)
-    upper = out["high"] - np.maximum(out["open"], out["close"])
-    out["upper_shadow"] = _safe_div(upper, out["close"]).fillna(0.0).clip(0, 1)
-    return out
-
-
-def add_limitup_flags(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.sort_values([CODE_COL, DATE_COL]).copy()
-    thr = limit_threshold_by_market(out)
-    out["thr_limit"] = thr
-
-    out["is_limit_up_today"] = (out["pct_chg"].values >= thr).astype(int)
-    out["is_limit_up_yday"] = out.groupby(CODE_COL)["is_limit_up_today"].shift(1).fillna(0).astype(int)
-
-    g = out.groupby(CODE_COL, group_keys=False)
-    for w in (5, 10, 20):
-        out[f"limit_ups_{w}"] = g["is_limit_up_today"].rolling(w).sum().reset_index(level=0, drop=True).fillna(0).astype(int)
-
-    # 距离上次涨停天数
-    def _days_since_last_limitup(x: pd.Series) -> pd.Series:
-        last = None
-        res = []
-        for i, v in enumerate(x.values):
-            if v == 1:
-                last = i
-                res.append(0)
-            else:
-                res.append(i - last if last is not None else 10000)
-        return pd.Series(res, index=x.index)
-
-    out["days_since_limit_up"] = g["is_limit_up_today"].apply(_days_since_last_limitup).clip(0, 10000)
-    return out
-
-
 def make_firstboard_label(df: pd.DataFrame) -> pd.DataFrame:
     """
-    首板标签（更严谨）：
-    label_first = 1 当且仅当：
-      - 次日涨停（next_is_limit_up == 1）
-      - 今日不是涨停
-      - 过去20日没有涨停（limit_ups_20 == 0）
-      - 非ST（仅基于名称包含ST识别）
-      - 排除新股窗口（例如上市<60天）
+    label_first = 1 的定义：
+    - 明天涨停
+    - 今天不是涨停
+    - 过去20天没有涨停
+    - 非 ST（meta）
+    - 上市>=60天
+    注意：is_limit_up_today / limit_ups_20 由 add_features_panel 生成
     """
     out = df.sort_values([CODE_COL, DATE_COL]).copy()
     out["next_is_limit_up"] = out.groupby(CODE_COL)["is_limit_up_today"].shift(-1).fillna(0).astype(int)
 
-    # 新股过滤：上市天数<60 直接排除（你可改 30/90）
     ok_listed = out["days_listed"] >= 60
 
     out["label_first"] = (
@@ -239,7 +161,8 @@ def topk_metrics_strict(df_part: pd.DataFrame, prob_col: str, k: int = 5):
     hit_days = 0
     hits = []
     lifts = []
-    for d, x in g:
+
+    for _, x in g:
         total_days += 1
         x = x.sort_values(prob_col, ascending=False)
         top = x.head(k)
@@ -269,6 +192,7 @@ def sample_for_training(train_df: pd.DataFrame, neg_ratio: int, seed: int):
     neg = train_df[train_df["label_first"] == 0]
     if len(pos) == 0:
         raise RuntimeError("训练集没有正样本(label_first=1)，请检查标签或过滤条件。")
+
     neg_sample = neg.sample(n=min(len(neg), len(pos) * neg_ratio), random_state=seed)
     out = pd.concat([pos, neg_sample], ignore_index=True).sample(frac=1, random_state=seed)
     return out
@@ -287,34 +211,18 @@ def main():
     df = clean_and_validate(raw)
     df = merge_meta(df, basic)
 
-    print("Building FIRST-BOARD features + label_first (with 10%/20% thresholds)...")
-    # 构建特征
-    df = add_rolling_ratios(df, windows=(5, 10, 20))
-    df = add_price_position(df, window=20)
-    df = add_candle_features(df)
-    df = add_limitup_flags(df)
+    # ✅ 统一特征：训练=线上
+    print("Building unified features (feature_set.add_features_panel) ...")
+    df = add_features_panel(df)
+
+    # ✅ 标签逻辑保留（但使用 add_features_panel 生成的 is_limit_up_today/limit_ups_20）
+    print("Building label_first ...")
     df = make_firstboard_label(df)
 
-    # 特征列（含 meta 特征）
-    FEATURE_COLS = [
-        # 基础价量
-        "open", "close", "high", "low", "vol", "amount", "pct_chg",
-        # 你已有因子
-        "amount_ratio", "ret_5", "ret_10", "ret20",
-        "breakout_20", "dist_to_hh20", "atr_pct",
-        "upper_shadow_ratio", "close_strength",
-        # 新增量能/位置/形态
-        "vol_ratio_5", "vol_ratio_10", "vol_ratio_20",
-        "amount_ratio_5", "amount_ratio_10", "amount_ratio_20",
-        "pos_20", "dist_to_ll20",
-        "range_pct", "close_strength2", "upper_shadow",
-        # 行为
-        "is_limit_up_yday", "limit_ups_5", "limit_ups_10", "limit_ups_20",
-        "days_since_limit_up",
-        # 元信息（基金级很常用）
-        "days_listed", "is_st_name",
-    ]
-    FEATURE_COLS = [c for c in FEATURE_COLS if c in df.columns]
+    # ✅ 统一特征清单（只取存在的列）
+    FEATURE_COLS = [c for c in FEATURE_COLS_DEFAULT if c in df.columns]
+    if not FEATURE_COLS:
+        raise RuntimeError("FEATURE_COLS 为空：请检查 FEATURE_COLS_DEFAULT 与 add_features_panel 输出。")
 
     df = df.replace([np.inf, -np.inf], np.nan)
     df = df.dropna(subset=FEATURE_COLS + [DATE_COL, CODE_COL, "label_first"])
@@ -337,6 +245,7 @@ def main():
     X_test = test_all[FEATURE_COLS]
     y_test = test_all["label_first"].astype(int)
 
+    # ✅ 用全量 train 的真实比例算 scale_pos_weight（比 sampled 更合理）
     pos_cnt = int(train_all["label_first"].sum())
     neg_cnt = int((train_all["label_first"] == 0).sum())
     spw = (neg_cnt / max(pos_cnt, 1))
@@ -413,7 +322,10 @@ def main():
         "top5_test": topk_test_5,
         "top10_test": topk_test_10,
         "firstboard_pos_rate_all": float(pos_rate),
-        "notes": "Label=next day limit-up & no limit-up in past 20 days & today not limit-up & non-ST by name & listed>=60 days. Threshold=10/20 by market_type.",
+        "notes": (
+            "Label=next day limit-up & no limit-up in past 20 days & today not limit-up "
+            "& non-ST by meta & listed>=60 days. Threshold=10/20 by market_type (feature_set)."
+        ),
     }
     MODEL_META_PATH.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Saved model: {MODEL_PATH}")

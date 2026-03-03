@@ -36,8 +36,7 @@ def phase_a_filter(snapshot: pd.DataFrame,
     # N1.5：ST过滤（依赖 name）
     if exclude_st and "name" in df.columns:
         name_u = df["name"].astype(str).str.upper()
-        df = df[~name_u.str.contains(r"\bst\b", regex=True)]
-        df = df[~name_u.str.contains(r"\*ST", regex=True)]
+        df = df[~name_u.str.contains("ST", regex=False)]
     n1_5 = len(df)
 
     # N2：流动性过滤
@@ -131,9 +130,9 @@ def phase_a_firstboard_snapshot(snapshot: pd.DataFrame,
     df = df.dropna(subset=["rng", "close_pos"])
 
     df = df[
-        (df["close_pos"] >= 0.70) &
-        (df["body"] >= 0.25 * df["rng"]) &
-        (df["upper_shadow"] <= 0.30 * df["rng"])
+        (df["close_pos"] >= 0.60) &
+        (df["body"] >= 0.20 * df["rng"]) &
+        (df["upper_shadow"] <= 0.40 * df["rng"])
     ]
     n4 = len(df)
 
